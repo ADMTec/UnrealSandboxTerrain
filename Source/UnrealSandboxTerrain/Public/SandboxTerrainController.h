@@ -5,26 +5,39 @@
 #include <memory>
 #include <queue>
 #include <mutex>
+#include <shared_mutex>
 #include <set>
 #include <list>
+#include <unordered_map>
+#include "VoxelIndex.h"
+#include "kvdb.hpp"
 #include "SandboxTerrainController.generated.h"
 
 struct TMeshData;
-class TVoxelData;
 class FLoadInitialZonesThread;
-class FAsyncThread;
-class USandboxTerrainMeshComponent;
+class UVoxelMeshComponent;
 class UTerrainZoneComponent;
-class UTerrainRegionComponent;
+struct TInstMeshTransArray;
+class UVdClientComponent;
 
-#define TH_STATE_NEW		0
-#define TH_STATE_RUNNING	1
-#define TH_STATE_STOP		2
-#define TH_STATE_FINISHED	3
+typedef TMap<int32, TInstMeshTransArray> TInstMeshTypeMap;
+typedef std::shared_ptr<TMeshData> TMeshDataPtr;
+typedef kvdb::KvFile<TVoxelIndex, TValueData> TKvFile;
 
-typedef struct TerrainControllerTask {
+
+typedef struct TControllerTask {
+
+	volatile bool bIsFinished = false;
+
 	std::function<void()> Function;
-} TerrainControllerTask;
+	
+	void WaitForFinish() {
+		while (!this->bIsFinished) {};
+	}
+	
+} TControllerTask;
+
+typedef std::shared_ptr<TControllerTask> TControllerTaskTaskPtr;
 
 UENUM(BlueprintType)
 enum class ETerrainInitialArea : uint8 {
@@ -39,20 +52,31 @@ enum TVoxelDataState {
 	READY_TO_LOAD
 };
 
-struct TVoxelDataInfo {
+class TVoxelDataInfo {
+
+private:
+	volatile double LastChange;
+	volatile double LastSave;
+	volatile double LastMeshGeneration;
+	volatile double LastCacheCheck;
+
+public:
+	TVoxelDataInfo() {	LoadVdMutexPtr = std::make_shared<std::mutex>(); }
+	~TVoxelDataInfo() {	}
+
 	TVoxelData* Vd = nullptr;
-
 	TVoxelDataState DataState = TVoxelDataState::UNDEFINED;
+	std::shared_ptr<std::mutex> LoadVdMutexPtr;
 
-	// mesh is generated
-	bool isNewGenerated() const {
-		return DataState == TVoxelDataState::GENERATED;
-	}
+	bool IsNewGenerated() const { return DataState == TVoxelDataState::GENERATED; }
+	bool IsNewLoaded() const { return DataState == TVoxelDataState::LOADED;	}
+	void SetChanged() { LastChange = FPlatformTime::Seconds(); }
+	bool IsChanged() { return LastChange > LastSave; }
+	void ResetLastSave() { LastSave = FPlatformTime::Seconds(); }
+	bool IsNeedToRegenerateMesh() { return LastChange > LastMeshGeneration; }
+	void ResetLastMeshRegenerationTime() { LastMeshGeneration = FPlatformTime::Seconds(); }
 
-	bool isNewLoaded() const {
-		return DataState == TVoxelDataState::LOADED;
-	}
-
+	void Unload();
 };
 
 USTRUCT()
@@ -133,9 +157,9 @@ public:
 	ASandboxTerrainController();
 
 	friend FLoadInitialZonesThread;
-	friend FAsyncThread;
 	friend UTerrainZoneComponent;
-	friend UTerrainRegionComponent;
+	friend UTerrainGeneratorComponent;
+	friend UVdClientComponent;
 
 	virtual void BeginPlay() override;
 
@@ -161,8 +185,11 @@ public:
 	UPROPERTY(EditAnywhere, Category = "UnrealSandbox Debug")
 	ETerrainInitialArea TerrainInitialArea = ETerrainInitialArea::TIA_3_3;
 
+	UPROPERTY(EditAnywhere)
+	UTerrainGeneratorComponent* TerrainGeneratorComponent;
+
 	//========================================================================================
-	// debug only
+	// 
 	//========================================================================================
 
 	UFUNCTION(BlueprintImplementableEvent, meta = (DisplayName = "On Start Build Sandbox Terrain"))
@@ -173,6 +200,23 @@ public:
 
 	UFUNCTION(BlueprintImplementableEvent, meta = (DisplayName = "On Progress Build Sandbox Terrain"))
 	void OnProgressBuildTerrain(float Progress);
+
+	//========================================================================================
+	// networking
+	//========================================================================================
+
+	UPROPERTY(EditAnywhere, Category = "UnrealSandbox Terrain Network")
+	uint32 ServerPort;
+
+	//========================================================================================
+	// save/load
+	//========================================================================================
+
+	UFUNCTION(BlueprintCallable, Category = "UnrealSandbox")
+	void SaveMapAsync();
+
+	UPROPERTY(EditAnywhere, Category = "UnrealSandbox Terrain")
+	int32 SaveGeneratedZones;
 
 	//========================================================================================
 	// materials
@@ -229,96 +273,156 @@ public:
 
 	//========================================================================================
 
-	void DigTerrainRoundHole(FVector v, float radius, float s);
+	float GetRealGroungLevel(float X, float Y);
 
-	void DigTerrainCubeHole(FVector origin, float r, float strength);
+	void DigTerrainRoundHole(const FVector& Origin, float Radius, float Strength);
 
-	void FillTerrainCube(FVector origin, const float r, const int matId);
+	void DigTerrainCubeHole(const FVector& Origin, float Extend);
 
-	void FillTerrainRound(const FVector origin, const float r, const int matId);
+	void FillTerrainCube(const FVector& Origin, float Extend, int MatId);
 
-	FVector GetZoneIndex(FVector v);
+	void FillTerrainRound(const FVector& Origin, float Extend, int MatId);
 
-	FVector GetZonePos(FVector Index);
+	TVoxelIndex GetZoneIndex(const FVector& Pos);
 
-	UTerrainZoneComponent* GetZoneByVectorIndex(FVector v);
+	FVector GetZonePos(const TVoxelIndex& Index);
 
-	FVector GetRegionIndex(FVector v);
-
-	FVector GetRegionPos(FVector Index);
-
-	UTerrainRegionComponent* GetRegionByVectorIndex(FVector v);
+	UTerrainZoneComponent* GetZoneByVectorIndex(const TVoxelIndex& Index);
 
 	template<class H>
-	void EditTerrain(FVector v, float radius, H handler);
+	void PerformTerrainChange(H handler);
 
 	template<class H>
-	void PerformTerrainChange(FVector v, float radius, H handler);
+	void EditTerrain(const H& ZoneHandler);
 
 	UMaterialInterface* GetRegularTerrainMaterial(uint16 MaterialId);
 
-	UMaterialInterface* GetTransitionTerrainMaterial(FString& TransitionName, std::set<unsigned short>& MaterialIdSet);
+	UMaterialInterface* GetTransitionTerrainMaterial(std::set<unsigned short>& MaterialIdSet);
 
-	void InvokeSafe(std::function<void()> Function);
+	//===============================================================================
+	// async tasks
+	//===============================================================================
+
+	TControllerTaskTaskPtr InvokeSafe(std::function<void()> Function);
+
+	void RunThread(TUniqueFunction<void()> Function);
+
+	//========================================================================================
+	// network
+	//========================================================================================
+
+	void NetworkSerializeVd(FBufferArchive& Buffer, const TVoxelIndex& VoxelIndex);
+
+	void NetworkSpawnClientZone(const TVoxelIndex& Index, FArrayReader& RawVdData);
 
 private:
+
+	void BeginServer();
+
+	void BeginClient();
+
+	void DigTerrainRoundHole_Internal(const FVector& Origin, float Radius, float Strength);
+
+	template<class H>
+	FORCEINLINE void PerformZoneEditHandler(TVoxelDataInfo& VdInfo, H handler, std::function<void(TMeshDataPtr)> OnComplete);
+
 	volatile bool bIsGeneratingTerrain = false;
+
+	volatile bool bIsWorkFinished = false;
 
 	volatile float GeneratingProgress;
 
+	volatile int  GeneratedVdConter;
+
+	//===============================================================================
+	// save/load
+	//===============================================================================
+
 	void Save();
 
-	void SaveJson(const TSet<FVector>& RegionPosSet);
+	void SaveJson();
 
-	void LoadJson(TSet<FVector>& RegionIndexSet);
+	void LoadJson();
+
+	bool OpenFile();
 	
 	TMap<FVector, UTerrainZoneComponent*> TerrainZoneMap;
 
-	TMap<FVector, UTerrainRegionComponent*> TerrainRegionMap;
+	void SpawnInitialZone();
 
-	TSet<FVector> RegionIndexSet;
-
-	TSet<FVector> SpawnInitialZone();
-
-	void SpawnZone(const FVector& pos);
+	void SpawnZone(const TVoxelIndex& pos);
 
 	UTerrainZoneComponent* AddTerrainZone(FVector pos);
 
-	UTerrainRegionComponent* GetOrCreateRegion(FVector pos);
-
-	TVoxelDataInfo FindOrCreateZoneVoxeldata(FVector location);
-
 	FLoadInitialZonesThread* InitialZoneLoader;
 
-	void InvokeZoneMeshAsync(UTerrainZoneComponent* zone, std::shared_ptr<TMeshData> mesh_data_ptr);
+	bool IsWorkFinished() { return bIsWorkFinished; };
 
-	void InvokeLazyZoneAsync(FVector index);
+	//===============================================================================
+	// async tasks
+	//===============================================================================
 
-	void AddAsyncTask(TerrainControllerTask zone_make_task);
+	void InvokeZoneMeshAsync(UTerrainZoneComponent* Zone, TMeshDataPtr MeshDataPtr);
 
-	TerrainControllerTask GetAsyncTask();
+	void InvokeLazyZoneAsync(TVoxelIndex& Index, TMeshDataPtr MeshDataPtr);
+
+	void AddAsyncTask(TControllerTaskTaskPtr TaskPtr);
+
+	TControllerTaskTaskPtr GetAsyncTask();
 
 	bool HasNextAsyncTask();
 
-	std::mutex AsyncTaskListMutex;
+	std::shared_timed_mutex AsyncTaskListMutex;
 
-	std::queue<TerrainControllerTask> AsyncTaskList;
+	std::queue<TControllerTaskTaskPtr> AsyncTaskList;
 
-	std::mutex VoxelDataMapMutex;
+	void WaitForFinishAsyncTask(const TControllerTaskTaskPtr Task) { while (!Task->bIsFinished) { if (bIsWorkFinished) return; }; };
 
-	TMap<FVector, TVoxelDataInfo> VoxelDataMap;
+	//===============================================================================
+	// threads
+	//===============================================================================
 
-	void RegisterTerrainVoxelData(TVoxelDataInfo VdInfo, FVector Index);
+	std::shared_timed_mutex ThreadListMutex;
 
-	TVoxelData* GetTerrainVoxelDataByPos(FVector point);
+	FGraphEventArray TerrainControllerEventList;
 
-	TVoxelData* GetTerrainVoxelDataByIndex(FVector index);
+	//===============================================================================
+	// voxel data storage
+	//===============================================================================
 
-	std::mutex ThreadListMutex;
+	TKvFile VdFile;
 
-	std::list<FAsyncThread*> ThreadList;
+	TKvFile MdFile;
 
-	void RunThread(std::function<void(FAsyncThread&)> Function);
+	TKvFile ObjFile;
+
+	std::shared_timed_mutex VoxelDataMapMutex;
+
+	std::unordered_map<TVoxelIndex, TVoxelDataInfo> VoxelDataIndexMap;
+
+	void RegisterTerrainVoxelData(TVoxelDataInfo VdInfo, TVoxelIndex Index);
+
+	TVoxelData* GetVoxelDataByPos(const FVector& Pos);
+
+	TVoxelData* GetVoxelDataByIndex(const TVoxelIndex& Index);
+
+	bool HasVoxelData(const TVoxelIndex& Index);
+
+	TVoxelDataInfo* GetVoxelDataInfo(const TVoxelIndex& Index);
+
+	void ClearVoxelData();
+
+	TVoxelData* LoadVoxelDataByIndex(const TVoxelIndex& Index);
+
+	std::shared_ptr<TMeshData> GenerateMesh(TVoxelData* Vd);
+
+	//===============================================================================
+	// mesh data storage
+	//===============================================================================
+
+	TMeshDataPtr LoadMeshDataByIndex(const TVoxelIndex& Index);
+
+	void LoadObjectDataByIndex(UTerrainZoneComponent* Zone, TInstMeshTypeMap& ZoneInstMeshMap);
 
 	//===============================================================================
 	// foliage
@@ -335,7 +439,7 @@ private:
 	//===============================================================================
 
 	UPROPERTY()
-	TMap<FString, UMaterialInterface*> TransitionMaterialCache;
+	TMap<uint64, UMaterialInterface*> TransitionMaterialCache;
 
 	UPROPERTY()
 	TMap<uint16, UMaterialInterface*> RegularMaterialCache;
@@ -353,9 +457,6 @@ private:
 	}
 
 protected:
-
-	UPROPERTY()
-	UTerrainGeneratorComponent* TerrainGeneratorComponent;
 	
 	virtual void OnGenerateNewZone(UTerrainZoneComponent* Zone);
 

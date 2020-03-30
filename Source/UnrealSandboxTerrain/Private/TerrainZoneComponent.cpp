@@ -2,66 +2,24 @@
 
 #include "UnrealSandboxTerrainPrivatePCH.h"
 #include "TerrainZoneComponent.h"
-#include "TerrainRegionComponent.h"
 #include "SandboxTerrainController.h"
 #include "SandboxVoxeldata.h"
+#include "VoxelIndex.h"
+#include "serialization.hpp"
 
 #include "DrawDebugHelpers.h"
 
 UTerrainZoneComponent::UTerrainZoneComponent(const FObjectInitializer& ObjectInitializer) : Super(ObjectInitializer) {
-	voxel_data = nullptr;
+	PrimaryComponentTick.bCanEverTick = false;
 }
 
 
-void UTerrainZoneComponent::MakeTerrain() {
-	if (voxel_data == NULL) {
-		voxel_data = GetTerrainController()->GetTerrainVoxelDataByPos(GetComponentLocation());
-	}
-
-	if (voxel_data == NULL) {
-		return;
-	}
-
-	std::shared_ptr<TMeshData> md_ptr = GenerateMesh();
-
-	if (IsInGameThread()) {
-		ApplyTerrainMesh(md_ptr);
-		voxel_data->resetLastMeshRegenerationTime();
-	} else {
-		UE_LOG(LogTemp, Warning, TEXT("non-game thread -> invoke async task"));
-		if (GetTerrainController() != NULL) {
-			GetTerrainController()->InvokeZoneMeshAsync(this, md_ptr);
-		}
-	}
+TMeshData const * UTerrainZoneComponent::GetCachedMeshData() {
+	return (TMeshData const *) CachedMeshDataPtr.get();
 }
 
-std::shared_ptr<TMeshData> UTerrainZoneComponent::GenerateMesh() {
-	double start = FPlatformTime::Seconds();
-
-	if (voxel_data == NULL || 
-		voxel_data->getDensityFillState() == TVoxelDataFillState::ZERO || 
-		voxel_data->getDensityFillState() == TVoxelDataFillState::ALL) {
-		return NULL;
-	}
-
-	TVoxelDataParam vdp;
-
-	if (GetTerrainController()->bEnableLOD) {
-		vdp.bGenerateLOD = true;
-		vdp.collisionLOD = GetTerrainController()->GetCollisionMeshSectionLodIndex();
-	} else {
-		vdp.bGenerateLOD = false;
-		vdp.collisionLOD = 0;
-	}
-
-	TMeshDataPtr md_ptr = sandboxVoxelGenerateMesh(*voxel_data, vdp);
-
-	double end = FPlatformTime::Seconds();
-	double time = (end - start) * 1000;
-
-	//UE_LOG(LogTemp, Warning, TEXT("ASandboxTerrainZone::generateMesh -------------> %f %f %f --> %f ms"), GetComponentLocation().X, GetComponentLocation().Y, GetComponentLocation().Z, time);
-
-	return md_ptr;
+void UTerrainZoneComponent::ClearCachedMeshData() {
+	CachedMeshDataPtr = nullptr;
 }
 
 void UTerrainZoneComponent::ApplyTerrainMesh(TMeshDataPtr MeshDataPtr, bool bPutToCache) {
@@ -73,14 +31,12 @@ void UTerrainZoneComponent::ApplyTerrainMesh(TMeshDataPtr MeshDataPtr, bool bPut
 		return;
 	}
 
-	UTerrainRegionComponent* Region = GetRegion();
-	if (Region == nullptr) {
-		return;
+	if (CachedMeshDataPtr != nullptr && CachedMeshDataPtr->TimeStamp > MeshDataPtr->TimeStamp) {
+		UE_LOG(LogTemp, Warning, TEXT("ASandboxTerrainZone::applyTerrainMesh skip late thread-> %f"), MeshDataPtr->TimeStamp);
 	}
 
 	if (bPutToCache) {
-		FVector Index = GetTerrainController()->GetZoneIndex(GetComponentLocation());
-		Region->PutMeshDataToCache(Index, MeshDataPtr);
+		CachedMeshDataPtr = MeshDataPtr;
 	}
 
 	//##########################################
@@ -139,54 +95,98 @@ void UTerrainZoneComponent::ApplyTerrainMesh(TMeshDataPtr MeshDataPtr, bool bPut
 	MainTerrainMesh->bCastHiddenShadow = true;
 	MainTerrainMesh->SetVisibility(true);
 
-	CollisionMesh->SetMeshData(MeshDataPtr);
-	CollisionMesh->SetCollisionProfileName(TEXT("BlockAll"));
+	MainTerrainMesh->SetCollisionMeshData(MeshDataPtr);
+	MainTerrainMesh->SetCollisionProfileName(TEXT("BlockAll"));
 
 	double end = FPlatformTime::Seconds();
 	double time = (end - start) * 1000;
-	//UE_LOG(LogTemp, Warning, TEXT("ASandboxTerrainZone::applyTerrainMesh ---------> %f %f %f --> %f ms"), GetComponentLocation().X, GetComponentLocation().Y, GetComponentLocation().Z, time);
+	UE_LOG(LogTemp, Warning, TEXT("ASandboxTerrainZone::applyTerrainMesh ---------> %f %f %f --> %f ms"), GetComponentLocation().X, GetComponentLocation().Y, GetComponentLocation().Z, time);
 }
 
-void UTerrainZoneComponent::SerializeInstancedMeshes(FBufferArchive& BinaryData) {
+typedef struct TInstantMeshData {
+	float X;
+	float Y;
+	float Z;
+
+	float Roll;
+	float Pitch;
+	float Yaw;
+
+	float ScaleX;
+	float ScaleY;
+	float ScaleZ;
+} TInstantMeshData;
+
+
+std::shared_ptr<std::vector<uint8>> UTerrainZoneComponent::SerializeInstancedMeshes() {
+	FastUnsafeSerializer Serializer;
 	int32 MeshCount = InstancedMeshMap.Num();
-	BinaryData << MeshCount;
+	Serializer << MeshCount;
 
 	for (auto& Elem : InstancedMeshMap) {
 		UHierarchicalInstancedStaticMeshComponent* InstancedStaticMeshComponent = Elem.Value;
 		int32 MeshTypeId = Elem.Key;
-
 		int32 MeshInstanceCount = InstancedStaticMeshComponent->GetInstanceCount();
 
-		BinaryData << MeshTypeId;
-		BinaryData << MeshInstanceCount;
+		Serializer << MeshTypeId << MeshInstanceCount;
 
 		for (int32 InstanceIdx = 0; InstanceIdx < MeshInstanceCount; InstanceIdx++) {
+			TInstantMeshData P;
 			FTransform InstanceTransform;
 			InstancedStaticMeshComponent->GetInstanceTransform(InstanceIdx, InstanceTransform, true);
 
-			float X = InstanceTransform.GetLocation().X;
-			float Y = InstanceTransform.GetLocation().Y;
-			float Z = InstanceTransform.GetLocation().Z;
+			P.X = InstanceTransform.GetLocation().X;
+			P.Y = InstanceTransform.GetLocation().Y;
+			P.Z = InstanceTransform.GetLocation().Z;
+			P.Roll = InstanceTransform.Rotator().Roll;
+			P.Pitch = InstanceTransform.Rotator().Pitch;
+			P.Yaw = InstanceTransform.Rotator().Yaw;
+			P.ScaleX = InstanceTransform.GetScale3D().X;
+			P.ScaleY = InstanceTransform.GetScale3D().Y;
+			P.ScaleZ = InstanceTransform.GetScale3D().Z;
 
-			float Roll = InstanceTransform.Rotator().Roll;
-			float Pitch = InstanceTransform.Rotator().Pitch;
-			float Yaw = InstanceTransform.Rotator().Yaw;
+			Serializer << P;
+		}
+	}
 
-			float ScaleX = InstanceTransform.GetScale3D().X;
-			float ScaleY = InstanceTransform.GetScale3D().Y;
-			float ScaleZ = InstanceTransform.GetScale3D().Z;
+	return Serializer.data();
+}
 
-			BinaryData << X;
-			BinaryData << Y;
-			BinaryData << Z;
+void UTerrainZoneComponent::DeserializeInstancedMeshes(std::vector<uint8>& Data, TInstMeshTypeMap& ZoneInstMeshMap) {
+	FastUnsafeDeserializer Deserializer(Data.data());
 
-			BinaryData << Roll;
-			BinaryData << Pitch;
-			BinaryData << Yaw;
+	int32 MeshCount;
+	Deserializer >> MeshCount;
 
-			BinaryData << ScaleX;
-			BinaryData << ScaleY;
-			BinaryData << ScaleZ;
+	for (int Idx = 0; Idx < MeshCount; Idx++) {
+		int32 MeshTypeId;
+		int32 MeshInstanceCount;
+
+		Deserializer >> MeshTypeId;
+		Deserializer >> MeshInstanceCount;
+
+		FTerrainInstancedMeshType MeshType;
+		if (GetTerrainController()->FoliageMap.Contains(MeshTypeId)) {
+			FSandboxFoliage FoliageType = GetTerrainController()->FoliageMap[MeshTypeId];
+
+			MeshType.Mesh = FoliageType.Mesh;
+			MeshType.MeshTypeId = MeshTypeId;
+			MeshType.StartCullDistance = FoliageType.StartCullDistance;
+			MeshType.EndCullDistance = FoliageType.EndCullDistance;
+		}
+
+		TInstMeshTransArray& InstMeshArray = ZoneInstMeshMap.FindOrAdd(MeshTypeId);
+		InstMeshArray.MeshType = MeshType;
+		InstMeshArray.TransformArray.Reserve(MeshInstanceCount);
+
+		for (int32 InstanceIdx = 0; InstanceIdx < MeshInstanceCount; InstanceIdx++) {
+			TInstantMeshData P;
+			Deserializer >> P;
+			FTransform Transform(FRotator(P.Pitch, P.Yaw, P.Roll), FVector(P.X, P.Y, P.Z), FVector(P.ScaleX, P.ScaleY, P.ScaleZ));
+
+			if (MeshType.Mesh != nullptr) {
+				InstMeshArray.TransformArray.Add(Transform);
+			}
 		}
 	}
 }
@@ -204,7 +204,7 @@ void UTerrainZoneComponent::SpawnInstancedMesh(FTerrainInstancedMeshType& MeshTy
 		InstancedStaticMeshComponent = NewObject<UHierarchicalInstancedStaticMeshComponent>(this, FName(*InstancedStaticMeshCompName));
 
 		InstancedStaticMeshComponent->RegisterComponent();
-		InstancedStaticMeshComponent->AttachTo(this);
+		InstancedStaticMeshComponent->AttachToComponent(this, FAttachmentTransformRules::KeepRelativeTransform, NAME_None);
 		InstancedStaticMeshComponent->SetStaticMesh(MeshType.Mesh);
 		InstancedStaticMeshComponent->SetCullDistances(MeshType.StartCullDistance, MeshType.EndCullDistance);
 		InstancedStaticMeshComponent->SetMobility(EComponentMobility::Static);

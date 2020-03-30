@@ -4,39 +4,13 @@
 
 #include "EngineMinimal.h"
 #include <unordered_map>
+#include "VoxelIndex.h"
 #include "TerrainGeneratorComponent.generated.h"
 
 class ASandboxTerrainController;
 class TVoxelData;
-
-
-struct TVoxelIndex {
-    int X = 0;
-    int Y = 0;
-    int Z = 0;
-
-	TVoxelIndex(int XIndex, int YIndex, int ZIndex) : X(XIndex), Y(YIndex), Z(ZIndex) { }
-    
-    bool operator==(const TVoxelIndex &other) const {
-        return (X == other.X && Y == other.Y && Z == other.Z);
-    }
-};
-
-namespace std {
-    
-    template <>
-    struct hash<TVoxelIndex> {
-        std::size_t operator()(const TVoxelIndex& k) const {
-            using std::hash;
-            
-            // Compute individual hash values for first,
-            // second and third and combine them using XOR
-            // and bit shifting:
-            
-            return ((hash<int>()(k.X) ^ (hash<int>()(k.Y) << 1)) >> 1) ^ (hash<int>()(k.Z) << 1);
-        }
-    };
-}
+class UTerrainZoneComponent;
+struct FSandboxFoliage;
 
 class TZoneHeightMapData {
     
@@ -46,9 +20,9 @@ private:
     
     float* HeightLevelArray;
     
-    float MaxHeightLevel;
+    float MaxHeightLevel = -999999.f;
     
-    float MinHeightLevel;
+    float MinHeightLevel = 999999.f;
     
 public:
     
@@ -58,14 +32,26 @@ public:
     
     FORCEINLINE void SetHeightLevel(TVoxelIndex VoxelIndex, float HeightLevel);
     
-    FORCEINLINE float GetHeightLevel(TVoxelIndex VoxelIndex) const ;
+    FORCEINLINE float GetHeightLevel(TVoxelIndex VoxelIndex) const;
     
     FORCEINLINE float GetMaxHeightLevel() const { return this->MaxHeightLevel; };
     
     FORCEINLINE float GetMinHeightLevel() const { return this->MinHeightLevel; };
 };
 
+USTRUCT()
+struct FTerrainUndergroundLayer {
+	GENERATED_BODY()
 
+	UPROPERTY(EditAnywhere)
+	int32 MatId;
+
+	UPROPERTY(EditAnywhere)
+	float StartDepth;
+
+	UPROPERTY(EditAnywhere)
+	FString Name;
+};
 
 /**
 *
@@ -76,15 +62,31 @@ class UNREALSANDBOXTERRAIN_API UTerrainGeneratorComponent : public USceneCompone
 	GENERATED_UCLASS_BODY()
 
 public:
+
 	virtual void BeginDestroy();
 
+	virtual void BeginPlay();
+
 public:
+
+	UPROPERTY(EditAnywhere, Category = "UnrealSandbox Terrain Generator")
+	TArray<FTerrainUndergroundLayer> UndergroundLayers;
+
+	UPROPERTY(EditAnywhere, Category = "UnrealSandbox Debug")
+	FVector MaxTerrainBounds;
+
 	void GenerateVoxelTerrain (TVoxelData &VoxelData);
 
 	float GroundLevelFunc(FVector v);
 
+	void GenerateNewFoliage(UTerrainZoneComponent* Zone);
+
+	void SpawnFoliage(int32 FoliageTypeId, FSandboxFoliage& FoliageType, FVector& v, FRandomStream& rnd, UTerrainZoneComponent* Zone);
+
 private:
     
+	TArray<FTerrainUndergroundLayer> UndergroundLayersTmp;
+
     std::unordered_map<TVoxelIndex, TZoneHeightMapData*> ZoneHeightMapCollection;
 
 	ASandboxTerrainController* GetTerrainController() {
@@ -93,11 +95,17 @@ private:
 	
 	float ClcDensityByGroundLevel(const FVector& v, const float gl) const;
 
-	//float ClcDensityByGroundLevel(FVector v);
-
 	float DensityFunc(const FVector& ZoneIndex, const FVector& LocalPos, const FVector& WorldPos);
 
-	unsigned char MaterialFunc(const FVector& LocalPos, const FVector& WorldPos, const float GroundLevel);
+	unsigned char MaterialFunc(const FVector& LocalPos, const FVector& WorldPos, float GroundLevel);
 
 	void GenerateZoneVolume(TVoxelData &VoxelData, const TZoneHeightMapData* ZoneHeightMapData);
+
+	FTerrainUndergroundLayer* GetUndergroundMaterialLayer(float Z, float GroundLevel);
+
+	int GetAllUndergroundMaterialLayers(TZoneHeightMapData* ZoneHeightMapData, const FVector& ZoneOrigin, TArray<FTerrainUndergroundLayer>* LayerList);
+
+	bool IsZoneOnGroundLevel(TZoneHeightMapData* ZoneHeightMapData, const FVector& ZoneOrigin);
+
+	bool IsZoneOverGroundLevel(TZoneHeightMapData* ZoneHeightMapData, const FVector& ZoneOrigin);
 };

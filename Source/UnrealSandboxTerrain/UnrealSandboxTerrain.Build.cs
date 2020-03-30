@@ -30,10 +30,11 @@ public class UnrealSandboxTerrain : ModuleRules
                 "CoreUObject",
                 "Engine",
                 "RenderCore",
-                "ShaderCore",
                 "RHI",
                 "Json",
-                "JsonUtilities"
+                "JsonUtilities",
+                "Sockets",
+                "Networking",
 				// ... add other public dependencies that you statically link with here ...
 			}
 			);
@@ -46,10 +47,11 @@ public class UnrealSandboxTerrain : ModuleRules
                 "CoreUObject",
                 "Engine",
                 "RenderCore",
-                "ShaderCore",
                 "RHI",
                 "Json",
-                "JsonUtilities"
+                "JsonUtilities",
+                "Sockets",
+                "Networking",
 				// ... add private dependencies that you statically link with here ...	
 			}
 			);
